@@ -12,6 +12,7 @@ import { Cohort } from "./sections/Cohort";
 import { Directory } from "./sections/Directory";
 import { Configuration } from "./sections/Configuration";
 import { Families } from "./sections/Families";
+import { HospitalNow } from "./sections/HospitalNow";
 import { Issues } from "./sections/Issues";
 import { Network } from "./sections/Network";
 import { Onboarding } from "./sections/Onboarding";
@@ -59,6 +60,7 @@ export default function App() {
         {section === "families" && <Families patientId={route.id} layer={route.tab} onOpen={openFamily} />}
         {section === "network" && <Network onOpen={(id) => openFamily(id)} />}
         {section === "approvals" && <Approvals />}
+        {section === "hospital" && <HospitalNow onOpen={(id) => openFamily(id)} />}
         {section === "issues" && <Issues />}
         {section === "releases" && <Releases />}
         {section === "onboarding" && <Onboarding patientId={route.id} onOpen={(id) => go({ section: "onboarding", id })} />}

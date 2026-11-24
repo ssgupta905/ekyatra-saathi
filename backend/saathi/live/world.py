@@ -594,7 +594,22 @@ class LiveWorld:
 
         A no-op convenience for seeding; raising a disruption against an
         unregistered resource id still works, it just has no display metadata.
+
+        Resource ids are expected to be unique across hospitals, because this
+        dictionary is keyed on them alone. Two hospitals both registering an
+        "MRI-1" would otherwise lose one silently, and the only symptom would
+        be a disruption landing on the wrong hospital's families. Say it
+        instead of swallowing it.
         """
+        standing = self.resources.get(resource.id)
+        if standing is not None and standing.hospital_id != resource.hospital_id:
+            logger.warning(
+                "resource id %r is registered at both %s and %s; ids must be unique "
+                "across hospitals or one hospital's machine replaces the other's",
+                resource.id,
+                standing.hospital_id,
+                resource.hospital_id,
+            )
         self.resources[resource.id] = resource
         if self.store is not None:
             self.store.save_resource(resource)
@@ -668,6 +683,14 @@ class LiveWorld:
         if resource is None:
             return False
         patient = self.patient(patient_id)
+        # The kind+department fallback below is deliberately loose — it is how
+        # a shared role or supply reaches the steps that lean on it without
+        # each one naming it. Loose across *hospitals* is a different thing
+        # entirely: "radiology" exists at every hospital in India, so without
+        # this check a Mumbai scanner going down re-plans a family in Gaya who
+        # has never been to Mumbai.
+        if patient is not None and patient.hospital_id != resource.hospital_id:
+            return False
         pathway = get_pathway(patient.pathway_id if patient else None)
         required_kind = pathway.resource_requirements.get(step.kind)
         return (

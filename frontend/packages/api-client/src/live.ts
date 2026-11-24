@@ -34,6 +34,7 @@ export type EventKind =
   | "holding_message.sent"
   | "options.ready"
   | "approval.recorded"
+  | "options.rejected"
   | "confirmation.received"
   | "process.answered"
   | "agent.started"
@@ -74,6 +75,7 @@ export const ALL_KINDS: EventKind[] = [
   "holding_message.sent",
   "options.ready",
   "approval.recorded",
+  "options.rejected",
   "confirmation.received",
   "process.answered",
   "agent.started",
@@ -94,6 +96,7 @@ export const PATIENT_KINDS = new Set<EventKind>([
   "holding_message.sent",
   "options.ready",
   "approval.recorded",
+  "options.rejected",
   "confirmation.received",
   "process.answered",
 ]);
@@ -108,6 +111,7 @@ export const COHORT_KINDS = new Set<EventKind>([
   "clock.tick",
   "disruption.raised",
   "approval.recorded",
+  "options.rejected",
 ]);
 
 /** The clock and the runner state ride on the snapshot, not the event. */
@@ -338,6 +342,7 @@ export const EVENT_TONE: Record<EventKind, "go" | "wait" | "critical" | "info" |
   "holding_message.sent": "wait",
   "options.ready": "wait",
   "approval.recorded": "go",
+  "options.rejected": "wait",
   "confirmation.received": "go",
   "process.answered": "info",
   "agent.started": "info",
@@ -365,6 +370,7 @@ export const EVENT_LABEL: Record<EventKind, string> = {
   "holding_message.sent": "Holding",
   "options.ready": "Options",
   "approval.recorded": "Approval",
+  "options.rejected": "Turned down",
   "confirmation.received": "Confirmed",
   "process.answered": "Process",
   "agent.started": "Working",

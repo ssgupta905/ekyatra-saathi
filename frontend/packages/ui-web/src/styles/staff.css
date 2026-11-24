@@ -1395,3 +1395,118 @@ tr.flash > td { animation: cite-flash 1.6s var(--ease); }
 .hx-panes.single { grid-template-columns: minmax(0, 1fr); background: var(--plane); }
 
 .hx-panes.single .hx-work { width: 100%; max-width: 1080px; margin: 0 auto; }
+
+/* ── hospital right now ──────────────────────────────────────────────────
+   The desk's live view of the hospital system. The urgent row is marked by a
+   left edge rather than a fill: a board that is mostly red stops meaning
+   anything, and most of what a hospital does on any given afternoon is
+   ordinary. */
+.hn-source {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 9px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+.hn-small { font-size: 11.5px; }
+
+.hn-feed { list-style: none; margin: 0; padding: 0; }
+.hn-row {
+  display: grid;
+  grid-template-columns: 58px 1fr auto;
+  gap: 10px;
+  align-items: baseline;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+  border-left: 3px solid transparent;
+  font-size: 12.5px;
+}
+.hn-row:last-child { border-bottom: none; }
+.hn-row.urgent { border-left-color: var(--critical, #b3261e); background: var(--surface-2, transparent); }
+.hn-when { font-size: 11.5px; opacity: 0.7; }
+.hn-what { min-width: 0; }
+.hn-who { justify-self: end; }
+
+.hn-down td { background: var(--surface-2, transparent); }
+
+@media (max-width: 720px) {
+  .hn-row { grid-template-columns: 1fr; gap: 4px; }
+  .hn-who { justify-self: start; }
+}
+
+/* ── turning options down ────────────────────────────────────────────────
+   Visually quieter than Approve, because it is the rarer move and should not
+   compete with it; but a real button, not a link, because it is a decision
+   with a name recorded against it. */
+.opt-welfare {
+  display: flex;
+  gap: 9px;
+  align-items: flex-start;
+  padding: 9px 11px;
+  margin-bottom: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.opt-welfare small { display: block; opacity: 0.72; margin-top: 2px; }
+
+.btn.subtle { background: transparent; opacity: 0.85; }
+.btn.danger { border-color: var(--status-stop, #b3261e); color: var(--status-stop, #b3261e); }
+
+.opt-reject {
+  margin-top: 10px;
+  padding: 10px 11px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+.opt-reject label { display: block; font-size: 12px; margin-bottom: 5px; }
+.opt-reject input { width: 100%; }
+.opt-reject-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 9px; }
+
+/* Two hospitals on one board: the hospital label on a combined-feed row, and
+   the picker that narrows to one. */
+.hn-at {
+  font-size: 11px;
+  opacity: 0.72;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 1px 5px;
+}
+.hn-picker { display: flex; align-items: center; gap: 8px; font-size: 12.5px; }
+.hn-board { padding-top: 2px; }
+
+/* ── dependency edges ────────────────────────────────────────────────────
+   Drawn *behind* the step cards. An edge routed over a card strikes through
+   its text and reads as a correction rather than a connection — the first
+   version did exactly that to "no date on record" on the radiology report.
+   Tucked underneath, a line emerging from one card and arriving at another
+   reads as what it is. The layer takes no pointer events either way. */
+.board-surface { position: relative; }
+.board-edges {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  overflow: visible;
+}
+.board-surface .board-columns { position: relative; z-index: 1; }
+/* The cards need their own background to sit on, or the edge shows through. */
+.board-surface .board-step { background: var(--surface); }
+.board-edge {
+  fill: none;
+  stroke: var(--line);
+  stroke-width: 1.5;
+}
+/* The chain holding the journey up. Heavier and warmer, because this is the
+   one a navigator is tracing. */
+.board-edge.blocking {
+  stroke: var(--status-wait, #b26a00);
+  stroke-width: 2.25;
+  opacity: 0.9;
+}
+.board-edges .head { fill: var(--line); }
+.board-edges .head.blocking { fill: var(--status-wait, #b26a00); }

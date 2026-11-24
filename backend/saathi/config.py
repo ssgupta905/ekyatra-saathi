@@ -9,10 +9,10 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -186,6 +186,56 @@ class Settings(BaseSettings):
     abdm_client_secret: str | None = None
     hospital_feed_url: str | None = None
 
+    # --- the hospital management system ---
+    #: Root of the Bahmni install, e.g. https://hms.example.org — not the
+    #: /openmrs path, which the adapter appends. Without it the desks are the
+    #: feed, which is the pilot's starting point rather than a failure.
+    bahmni_base_url: str | None = None
+    bahmni_username: str | None = None
+    bahmni_password: str | None = None
+    #: How often to re-read the appointment window. Bahmni's appointments carry
+    #: no `dateChanged`, so there is no cursor to poll against and every cycle
+    #: reads the whole window — keep this honest about that cost. Three seconds
+    #: is what makes a judge's cancellation feel immediate on stage.
+    bahmni_poll_seconds: float = 3.0
+    #: How far either side of today the appointment window reaches. The window
+    #: is re-read in full every cycle, so this is the one knob that decides how
+    #: much work a poll is.
+    bahmni_window_days: int = 30
+    #: How often to ask for clinical results. Separate from the appointment
+    #: poll because this side *does* support `_lastUpdated`, so it is a cheap
+    #: cursor query and does not need the same cadence.
+    bahmni_clinical_poll_seconds: float = 15.0
+
+    # --- OpenEMR, for the seeder ---
+    #: Root of the OpenEMR install, e.g. http://localhost:8300 — not the
+    #: /apis/default/fhir path, which the adapter appends.
+    openemr_base_url: str | None = None
+    #: From `python -m saathi.bootstrap.openemr_seed --register`. The signing
+    #: key is a path, never the key itself: a private key in an environment
+    #: variable ends up in logs and dashboards.
+    openemr_client_id: str | None = None
+    openemr_key_id: str | None = None
+    openemr_key_path: str | None = None
+
+    #: One entry per hospital that has a system to read, in the same `ID=VALUE`
+    #: style as `hospital_places`:
+    #:
+    #:     TMH-MUM=bahmni|https://hms.example.org|user|pass
+    #:     GAYA-DH=fhir|https://fhir.example.org/fhir
+    #:
+    #: The kind decides the adapter; everything after it is that adapter's
+    #: connection detail. A hospital absent from this list has no system to
+    #: read, which is not a failure: its desks are the feed.
+    #:
+    #: The `bahmni_*` settings above remain a single-hospital shorthand, so a
+    #: deployment that predates this keeps working untouched.
+    #: `NoDecode` so the environment source hands this over as the plain
+    #: string it is. Without it pydantic-settings tries to JSON-decode a
+    #: `list[str]` env var and the process dies at startup naming the field
+    #: but not the reason — see `_comma_separated` below.
+    hospital_systems: Annotated[list[str], NoDecode] = Field(default_factory=list)
+
     # --- reaching the family ---
     whatsapp_phone_number_id: str | None = None
     whatsapp_token: str | None = None
@@ -207,6 +257,34 @@ class Settings(BaseSettings):
                 "controls must never be reachable on real records"
             )
         return self
+
+    @field_validator("hospital_systems", mode="before")
+    @classmethod
+    def _comma_separated(cls, raw: object) -> object:
+        """Accept `A,B` as well as `["A","B"]` from the environment.
+
+        Paired with `NoDecode` on the field. Without both, a perfectly
+        reasonable `SAATHI_HOSPITAL_SYSTEMS=TMH-MUM=bahmni|…,GAYA-DH=fhir|…`
+        kills the process at startup with an error naming the field and not
+        the reason. Nobody writing a deployment variable expects to quote JSON
+        into it.
+
+        A string that still looks like JSON is decoded as JSON, so both forms
+        work and an existing deployment cannot break.
+        """
+        import json as _json
+
+        if not isinstance(raw, str):
+            return raw
+        text = raw.strip()
+        if not text:
+            return []
+        if text.startswith("["):
+            try:
+                return _json.loads(text)
+            except ValueError as exc:
+                raise ValueError(f"SAATHI_HOSPITAL_SYSTEMS is not valid JSON: {exc}") from exc
+        return [part.strip() for part in text.split(",") if part.strip()]
 
     @field_validator("partners")
     @classmethod
@@ -303,6 +381,16 @@ class Settings(BaseSettings):
     @property
     def hospital_feed_enabled(self) -> bool:
         return bool(self.hospital_feed_url)
+
+    @property
+    def bahmni_enabled(self) -> bool:
+        """Whether an HMS is connected at all.
+
+        Note what is *not* required here: `tools_allow_network`. That switch
+        exists to stop a demo hammering a public geocoder, and a hospital's own
+        HMS is not that — a pilot that configured Bahmni meant it.
+        """
+        return bool(self.bahmni_base_url and self.bahmni_username and self.bahmni_password)
 
     @property
     def whatsapp_enabled(self) -> bool:

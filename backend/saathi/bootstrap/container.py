@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import date
+from pathlib import Path
 
 from ..adapters.clock import SystemClock
 from ..adapters.ledger import SqlEvidenceLedger
@@ -31,6 +32,7 @@ from ..live.runner import LiveRunner
 from ..live.world import LiveWorld
 from ..planner.graph import VisitPlanner
 from ..ports.clock import Clock
+from ..ports.hospital import HospitalSystem
 from ..ports.identity import IdentityProvider
 from ..ports.language import LanguageLayer
 from ..ports.ledger import EvidenceLedger
@@ -63,6 +65,10 @@ class Container:
     consent: ConsentRegistry | None = None
     #: A family's background, documents and admissions. Never read by the planner.
     onboarding: OnboardingStore | None = None
+    #: Which system to ask about each hospital, keyed by hospital id. Called,
+    #: not indexed: an unknown hospital gets the desk adapter rather than a
+    #: KeyError, because "this hospital has no system" is an ordinary state.
+    hospitals: HospitalSystems | None = None
 
     @property
     def cohort(self) -> SyntheticCohort:
@@ -250,6 +256,157 @@ def build_onboarding(settings: Settings) -> OnboardingStore:
     return MemoryOnboardingStore()
 
 
+class HospitalSystems:
+    """Which system to ask about a given hospital.
+
+    The same shape as `HospitalRules` above, for the same reason: everything
+    that varies per hospital should be reachable by one cached call keyed on
+    `hospital_id`, so the planner and the connector take a callable rather
+    than a dictionary they might index with the wrong key.
+
+    Never returns None. A hospital with nothing configured gets `DeskHospital`,
+    whose `live` is False and which is therefore never polled — "the desks are
+    the feed" is the pilot's stated starting point, not a degraded mode.
+    """
+
+    def __init__(self, systems: dict[str, HospitalSystem]) -> None:
+        self._systems = systems
+        self._desks: HospitalSystem | None = None
+
+    def __call__(self, hospital_id: str) -> HospitalSystem:
+        found = self._systems.get(hospital_id)
+        if found is not None:
+            return found
+        if self._desks is None:
+            from ..adapters.hospital import DeskHospital
+
+            self._desks = DeskHospital()
+        return self._desks
+
+    def all(self) -> dict[str, HospitalSystem]:
+        """Every hospital that actually has a system, for the connector to poll."""
+        return dict(self._systems)
+
+    def close(self) -> None:
+        for system in self._systems.values():
+            closer = getattr(system, "close", None)
+            if callable(closer):
+                closer()
+
+
+def _parse_system(entry: str) -> tuple[str, HospitalSystem] | None:
+    """`TMH-MUM=bahmni|https://…|user|pass` -> one adapter, or None if unusable.
+
+    Refuses rather than guesses. A typo in a hospital id would otherwise
+    attach a real hospital's system to a hospital that does not exist, and the
+    only symptom would be a board that never changes.
+    """
+    hospital_id, _, spec = entry.partition("=")
+    hospital_id = hospital_id.strip()
+    parts = [p.strip() for p in spec.split("|")]
+    kind = parts[0].lower() if parts else ""
+    base_url = parts[1] if len(parts) > 1 else ""
+
+    if not hospital_id or not kind or not base_url:
+        logger.warning("ignoring malformed hospital system entry %r", entry)
+        return None
+
+    if kind == "bahmni":
+        from ..adapters.hospital import BahmniHospital
+
+        if len(parts) < 4:
+            logger.warning("bahmni entry for %s has no username/password; ignoring", hospital_id)
+            return None
+        return hospital_id, BahmniHospital(
+            base_url=base_url, username=parts[2], password=parts[3]
+        )
+
+    if kind == "fhir":
+        from ..adapters.hospital import FhirHospital
+
+        return hospital_id, FhirHospital(
+            base_url=base_url,
+            username=parts[2] if len(parts) > 2 and parts[2] else None,
+            password=parts[3] if len(parts) > 3 and parts[3] else None,
+        )
+
+    if kind == "openemr":
+        # `HOSP=openemr|<base>|<client id>|<key id>|<pem path>`
+        # The key never appears in the environment, only its path: a private
+        # key pasted into a deployment variable ends up in logs, dashboards
+        # and shoulder-surfing range.
+        from ..adapters.hospital import FhirHospital
+        from ..adapters.hospital._smart import SYSTEM_SCOPES, SmartTokens
+
+        if len(parts) < 5:
+            logger.warning(
+                "openemr entry for %s needs base|client_id|key_id|key_path; ignoring",
+                hospital_id,
+            )
+            return None
+        try:
+            pem = Path(parts[4]).read_text()
+        except OSError as exc:
+            logger.warning("cannot read the signing key for %s: %s", hospital_id, exc)
+            return None
+
+        root = base_url.rstrip("/")
+        return hospital_id, FhirHospital(
+            base_url=f"{root}/apis/default/fhir",
+            token=SmartTokens(
+                token_url=f"{root}/oauth2/default/token",
+                client_id=parts[2],
+                key_id=parts[3],
+                private_key_pem=pem,
+                scope=SYSTEM_SCOPES,
+            ),
+            # OpenEMR's Appointment search has no `_include`; see the adapter.
+            supports_include=False,
+        )
+
+    logger.warning("unknown hospital system kind %r for %s; ignoring", kind, hospital_id)
+    return None
+
+
+def build_hospitals(settings: Settings) -> HospitalSystems:
+    """Every connected hospital system, keyed by hospital id.
+
+    Two sources, in order. `hospital_systems` is the real one and may name any
+    number of hospitals. The older single `bahmni_*` block is kept as a
+    shorthand for the common one-hospital case and is attached to the first
+    configured hospital, so an existing deployment keeps working without
+    editing its environment.
+    """
+    systems: dict[str, HospitalSystem] = {}
+
+    for entry in settings.hospital_systems:
+        parsed = _parse_system(entry)
+        if parsed is not None:
+            hospital_id, system = parsed
+            systems[hospital_id] = system
+            logger.info("%s answers over %s", hospital_id, system.name)
+
+    if settings.bahmni_enabled:
+        from ..adapters.hospital import BahmniHospital
+
+        default_id = (
+            settings.hospital_places[0].partition("=")[0].strip()
+            if settings.hospital_places
+            else ""
+        )
+        if default_id and default_id not in systems:
+            systems[default_id] = BahmniHospital(
+                base_url=settings.bahmni_base_url or "",
+                username=settings.bahmni_username or "",
+                password=settings.bahmni_password or "",
+            )
+            logger.info("%s answers over bahmni (from the single-hospital settings)", default_id)
+
+    if not systems:
+        logger.info("no hospital system connected: the desks are the feed")
+    return HospitalSystems(systems)
+
+
 def build_actors(settings: Settings, world: LiveWorld):
     """The Groq actors, or None. Every caller guards on None."""
     if not settings.groq_api_key:
@@ -312,6 +469,7 @@ def build_container(settings: Settings | None = None, today: date | None = None)
     bus = EventBus()
     alerts: list = []
     toolbox = build_toolbox(settings)
+    hospitals = build_hospitals(settings)
     runner = LiveRunner(
         world=world,
         bus=bus,
@@ -320,6 +478,10 @@ def build_container(settings: Settings | None = None, today: date | None = None)
         alerts=alerts,
         actors=build_actors(settings, world),
         tools=toolbox,
+        hospitals=hospitals,
+        hospital_poll_seconds=settings.bahmni_poll_seconds,
+        hospital_window_days=settings.bahmni_window_days,
+        hospital_timezone=settings.hospital_timezone,
         inbound_every_seconds=settings.live_inbound_every_seconds,
     )
     # Close the loop the toolbox was built for: every fact it fetches becomes a
@@ -370,4 +532,5 @@ def build_container(settings: Settings | None = None, today: date | None = None)
         rules=rules,
         consent=consent,
         onboarding=onboarding,
+        hospitals=hospitals,
     )

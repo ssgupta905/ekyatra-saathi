@@ -82,6 +82,7 @@ export function PendingApprovalsQueue({
               patientId={active.patient_id}
               approverRole={approverRole}
               approverName={approverName}
+              hospitalCaused={active.hospital_caused}
               onApproved={() => {
                 setSelected(null);
                 refresh();

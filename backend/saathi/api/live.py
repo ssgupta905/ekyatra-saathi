@@ -19,8 +19,9 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from ..domain.enums import DisruptionKind, Role
+from ..domain.enums import DisruptionKind, Role, SourceSystem
 from ..live.events import QUEUE_LIMIT as _QUEUE_LIMIT
+from ..ports.hospital import HospitalUnavailable
 from .access import (
     AdminOnly,
     AnyStaff,
@@ -381,12 +382,21 @@ async def pending_options(state: ContainerDep) -> list[dict]:
         requires_doctor = any(
             runner.touches_treatment(option) for option in option_set.options
         )
+        # Who caused this decides whether the family should be asked to absorb
+        # its cost. A hospital-side change is the hospital's to carry, so the
+        # desk is offered the welfare fund; a change the family asked for is
+        # not. `raised_by` is the only honest source for that.
+        disruption = state.world.disruptions.get(option_set.disruption_id)
+        hospital_caused = (
+            disruption is not None and disruption.raised_by is SourceSystem.HOSPITAL_FEED
+        )
         rows.append(
             {
                 "patient_id": option_set.patient_id,
                 "disruption_id": option_set.disruption_id,
                 "option_count": len(option_set.options),
                 "requires_doctor": requires_doctor,
+                "hospital_caused": hospital_caused,
                 "created_at": option_set.created_at.isoformat(),
             }
         )
@@ -430,7 +440,42 @@ async def approve_disruption_option(
         raise HTTPException(404, str(exc)) from exc
     except PermissionError as exc:
         raise HTTPException(403, str(exc)) from exc
+    except HospitalUnavailable as exc:
+        # The hospital system refused the new slot, so nothing was approved and
+        # nobody was told. 502 rather than 500: this is the other system's
+        # answer, and the desk needs to read it rather than see "server error".
+        raise HTTPException(502, f"the hospital system refused this slot: {exc}") from exc
     return approval.model_dump(mode="json")
+
+
+class RejectRequest(BaseModel):
+    patient_id: str
+    rejected_by_role: Role
+    rejected_by: str
+    reason: str = ""
+
+
+@router.post("/disruptions/{disruption_id}/reject", dependencies=[Approver])
+async def reject_disruption_options(
+    state: ContainerDep, disruption_id: str, body: RejectRequest, principal: PrincipalDep
+) -> dict:
+    """Turn every option down and take the family on by hand.
+
+    The counterpart to approving, and gated the same way, because clearing a
+    family out of the queue is a decision with consequences for them. Nothing
+    is written back to the hospital and the family is not messaged: this
+    records that a named person decided, and lets the planner say what is
+    actually true about the journey now.
+    """
+    try:
+        return await state.runner.reject_options(
+            patient_id=body.patient_id,
+            rejected_by_role=principal.role if principal else body.rejected_by_role,
+            rejected_by=principal.name if principal else body.rejected_by,
+            reason=body.reason,
+        )
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
 
 
 class IVRConfirmRequest(BaseModel):

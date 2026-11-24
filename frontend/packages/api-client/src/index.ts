@@ -1,6 +1,7 @@
 export * from "./api";
 export * from "./auth";
 export * from "./client";
+export * from "./hospital";
 export * from "./live";
 export * from "./onboarding";
 export * from "./orchestration";

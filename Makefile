@@ -1,4 +1,4 @@
-.PHONY: android-release dev-users migrate api-real help install demo demo-audio demo-mov demo-video demo-video-headless demo-check fetch-reference test lint api web dev web-test web-typecheck emulator android-build android-test android-install android-run android-strings docker seed clean
+.PHONY: demo-hospital openemr-seed openemr-seed-write demo-two-hospital bahmni-check bahmni-seed bahmni-seed-write android-release dev-users migrate api-real help install demo demo-audio demo-mov demo-video demo-video-headless demo-check fetch-reference test lint api web dev web-test web-typecheck emulator android-build android-test android-install android-run android-strings docker seed clean
 
 PY ?= .venv/bin/python
 # Override when something else already owns 8000:  make api PORT=8001
@@ -76,6 +76,31 @@ api-real: migrate
 #   .venv/bin/python -m saathi.cli.users add --username U --name N --role desk
 dev-users:
 	PYTHONPATH=backend $(PY) -m saathi.cli.users dev-users
+
+# The hospital system. `bahmni-check` reads and reports; `bahmni-seed` says what
+# it would change and writes nothing. Only `bahmni-seed-write` touches Bahmni,
+# and `--local` adds the matching families to our own records so a cancellation
+# in Bahmni lands on a family this system knows.
+demo-hospital:  ## Film the OpenEMR flow: real HMS screen, agents, graph, approval.
+	cd demo && npm install --no-audit --no-fund && node hospital-demo.mjs
+
+openemr-seed:  ## Say what the OpenEMR seed would change. Writes nothing.
+	PYTHONPATH=backend $(PY) -m saathi.bootstrap.openemr_seed
+
+openemr-seed-write:  ## Seed OpenEMR and our own records to the demo's start state.
+	SAATHI_WORLD=real PYTHONPATH=backend $(PY) -m saathi.bootstrap.openemr_seed --write --local
+
+demo-two-hospital:  ## Film the two-hospital flow. Needs the API, the console and a seeded Bahmni.
+	cd demo && npm install --no-audit --no-fund && node two-hospital.mjs
+
+bahmni-check:  ## Can we reach the configured Bahmni, and what does it hold?
+	PYTHONPATH=backend $(PY) -m saathi.bootstrap.bahmni_seed --check
+
+bahmni-seed:  ## Say what the demo seed would change in Bahmni. Writes nothing.
+	PYTHONPATH=backend $(PY) -m saathi.bootstrap.bahmni_seed
+
+bahmni-seed-write:  ## Create the demo's services, patients and appointments, both sides.
+	SAATHI_WORLD=real PYTHONPATH=backend $(PY) -m saathi.bootstrap.bahmni_seed --write --local
 
 # Bring the records database to the current schema. The API also does this on
 # start; this is for doing it on purpose, ahead of a deploy.

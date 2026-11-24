@@ -26,6 +26,10 @@ dependencies = [
   # Local identity: signed sign-in tokens and hashed staff passwords.
   "PyJWT>=2.8",
   "argon2-cffi>=23.1",
+  # RSA, for SMART Backend Services. An EHR like OpenEMR will not take a
+  # password or a client secret for system access: the connector signs a JWT
+  # assertion with a private key. PyJWT needs this to do RS384 at all.
+  "cryptography>=43.0",
 ]
 
 [project.optional-dependencies]

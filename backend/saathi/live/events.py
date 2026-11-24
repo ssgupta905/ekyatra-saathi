@@ -54,6 +54,9 @@ class EventKind:
     OPTIONS_READY = "options.ready"
     #: A navigator/doctor picked an option; the approval itself was logged.
     APPROVAL_RECORDED = "approval.recorded"
+    #: A navigator/doctor turned every option down and took the family on by
+    #: hand. Distinct from an approval that never came: somebody decided.
+    OPTIONS_REJECTED = "options.rejected"
     #: A family confirmed a message — IVR press-1 or a WhatsApp reply.
     CONFIRMATION_RECEIVED = "confirmation.received"
     #: A process-only answer was sent in reply to an inbound question.

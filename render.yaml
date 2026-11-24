@@ -121,3 +121,55 @@ services:
         sync: false
       - key: NODE_VERSION
         value: "22"
+
+  # The district hospital's system — a second HMS, deliberately unlike the
+  # first. Bahmni speaks its own REST API with no change feed; this speaks
+  # plain FHIR R4 with `_lastUpdated` cursors. Saathi reads both through one
+  # port, which is what "plugs into any HMS" has to mean to be worth saying.
+  #
+  # Bahmni itself cannot live here: Render offers managed Postgres and Key
+  # Value only, and OpenMRS needs MariaDB. Bahmni runs on its own host.
+  - type: web
+    name: ekyatra-hapi-fhir
+    runtime: image
+    image:
+      url: docker.io/hapiproject/hapi:latest
+    # HAPI is a Spring Boot app and wants roughly a gigabyte to be comfortable.
+    # Raise this if the service restarts under load; `free` will not hold it.
+    plan: starter
+    region: frankfurt
+    healthCheckPath: /fhir/metadata
+    envVars:
+      # Deliberately NOT `fromDatabase.connectionString`: Render hands out a
+      # `postgres://user:pw@host/db` URL and Spring needs the JDBC form,
+      # `jdbc:postgresql://host:5432/db`. Wiring the two together silently
+      # yields a driver error at boot, so this is entered by hand from the
+      # database's connection details, and the credentials come separately.
+      - key: SPRING_DATASOURCE_URL
+        sync: false
+      - key: SPRING_DATASOURCE_USERNAME
+        fromDatabase:
+          name: ekyatra-hapi-db
+          property: user
+      - key: SPRING_DATASOURCE_PASSWORD
+        fromDatabase:
+          name: ekyatra-hapi-db
+          property: password
+      - key: SPRING_DATASOURCE_DRIVER_CLASS_NAME
+        value: org.postgresql.Driver
+      - key: SPRING_JPA_PROPERTIES_HIBERNATE_DIALECT
+        value: ca.uhn.fhir.jpa.model.dialect.HapiFhirPostgresDialect
+      # Appointment is the resource the connector reads, and ServiceRequest +
+      # Observation are the creatinine beat. All are on by default; named here
+      # so a future narrowing of the server's scope is a visible change.
+      - key: HAPI_FHIR_FHIR_VERSION
+        value: R4
+      # Writes come from the seeder and from the lab posting a result, so the
+      # server must accept them.
+      - key: HAPI_FHIR_ALLOW_EXTERNAL_REFERENCES
+        value: "true"
+
+databases:
+  - name: ekyatra-hapi-db
+    plan: free
+    region: frankfurt

@@ -203,6 +203,24 @@ class IVRConfirmation:
 _DOCTOR_GATED_KINDS = frozenset({StepKind.TREATMENT, StepKind.MAINTENANCE_DOSE})
 
 
+def _describe_options(options) -> str:
+    """What each option costs the family, in one line per option.
+
+    Nights, trips and dose delay — the same vocabulary the panel uses, and
+    deliberately not a rupee figure: the backend will not report a fare it was
+    not given, and this text goes into another organisation's record where a
+    number nobody can source is worse than no number.
+    """
+    lines = []
+    for index, option in enumerate(options, start=1):
+        parts = [f"{option.nights_added:+d} nights", f"{option.extra_trips:+d} trips"]
+        if option.dose_delay_days:
+            parts.append(f"{option.dose_delay_days}d dose delay")
+        on = f" on {option.target_on:%a %d %b}" if option.target_on else ""
+        lines.append(f"{index}.{on} — " + ", ".join(parts))
+    return "Options offered:\n" + "\n".join(lines)
+
+
 @dataclass
 class LiveRunner:
     world: LiveWorld
@@ -227,6 +245,23 @@ class LiveRunner:
     #: Seconds of real time between caregiver messages. Actors are the only
     #: unbounded cost in the loop, so their cadence is explicit.
     inbound_every_seconds: float = 15.0
+    #: Which system to ask about each hospital, keyed by hospital id. A
+    #: callable, not a dict: an unknown hospital answers with the desk adapter
+    #: rather than raising, because "no system here" is an ordinary state.
+    hospitals: object | None = None
+    #: How often to re-read the appointment window. Bahmni has no change
+    #: feed, so each cycle is a full read — see `live/hospital_sync.py`.
+    hospital_poll_seconds: float = 3.0
+    hospital_window_days: int = 30
+    hospital_timezone: str = "Asia/Kolkata"
+    #: patient id -> the approval `Task` filed in that hospital's own system,
+    #: so it can be closed when a person decides. Absent when the hospital has
+    #: no system, or when filing it failed — neither blocks the decision.
+    approval_tasks: dict = field(default_factory=dict)
+    #: One connector per hospital that has a system, keyed by hospital id.
+    #: Each holds its own snapshot and cursor: two hospitals both running an
+    #: "MRI-1" must not share a dictionary keyed on appointment reference.
+    hospital_syncs: dict = field(default_factory=dict)
 
     #: Work that has started and not finished, keyed by id. Published so a
     #: console shows that something is happening instead of leaving a navigator
@@ -259,6 +294,7 @@ class LiveRunner:
     _task: asyncio.Task | None = None
     _inbound_task: asyncio.Task | None = None
     _partner_task: asyncio.Task | None = None
+    _hospital_tasks: list = field(default_factory=list)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _rng: random.Random = field(default_factory=lambda: random.Random(7))
     _work_seq: int = 0
@@ -299,13 +335,19 @@ class LiveRunner:
             logger.info("partner loop started: simulated organisations will answer")
         elif self.partners is None:
             logger.info("no partner desk: nothing will answer on the network's behalf")
+        self._start_hospital_sync()
         # Plan once up front so a console that connects before the first tick
         # still sees real decisions rather than an empty page.
         await self.plan_all()
         await self.update_metrics()
 
     async def stop(self) -> None:
-        for task in (self._task, self._inbound_task, self._partner_task):
+        for task in (
+            self._task,
+            self._inbound_task,
+            self._partner_task,
+            *self._hospital_tasks,
+        ):
             if task is not None:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -313,6 +355,7 @@ class LiveRunner:
         self._task = None
         self._inbound_task = None
         self._partner_task = None
+        self._hospital_tasks = []
 
     @contextlib.asynccontextmanager
     async def working(self, task: str, *, patient_id: str | None = None, detail: str = ""):
@@ -435,6 +478,82 @@ class LiveRunner:
             except Exception:  # noqa: BLE001 - the world must not stop on one bad day
                 logger.exception("tick failed; continuing")
                 await asyncio.sleep(1.0)
+
+    def _start_hospital_sync(self) -> None:
+        """Begin polling every connected hospital system, one task each.
+
+        Separate tasks rather than one loop over all hospitals: a district
+        hospital that goes unreachable must not stop the cancer centre's
+        three-second poll, and on stage that difference is the whole demo.
+
+        Said out loud either way. A connector that silently never starts looks
+        exactly like a hospital that never changes anything, and the only
+        symptom is a button press that does nothing.
+        """
+        if self._hospital_tasks:
+            return
+        configured = self.hospitals.all() if self.hospitals is not None else {}
+        connected = {
+            hospital_id: system
+            for hospital_id, system in configured.items()
+            if getattr(system, "live", False)
+        }
+        if not connected:
+            logger.info("no hospital system connected: the desks are the feed")
+            return
+
+        from .hospital_sync import HospitalSync
+
+        for hospital_id, system in connected.items():
+            self.hospital_syncs[hospital_id] = HospitalSync(
+                hospital=system,
+                runner=self,
+                hospital_id=hospital_id,
+                window_days=self.hospital_window_days,
+                timezone=self.hospital_timezone,
+            )
+            self._hospital_tasks.append(
+                asyncio.create_task(
+                    self._hospital_loop(hospital_id), name=f"saathi-hospital-{hospital_id}"
+                )
+            )
+            logger.info(
+                "connector started for %s: reading %s every %.1fs over a %d-day window",
+                hospital_id,
+                getattr(system, "name", "its hospital system"),
+                self.hospital_poll_seconds,
+                self.hospital_window_days,
+            )
+
+    async def _hospital_loop(self, hospital_id: str) -> None:
+        """Re-read one hospital's appointment window, forever."""
+        pace = max(1.0, self.hospital_poll_seconds)
+        sync = self.hospital_syncs[hospital_id]
+        while True:
+            try:
+                await sync.poll_once()
+                await asyncio.sleep(pace)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - one bad read must not stop the rest
+                logger.exception("hospital poll failed for %s; continuing", hospital_id)
+                await asyncio.sleep(pace)
+
+    def sync_for(self, hospital_id: str):
+        """The connector for one hospital, or None if it has no system."""
+        return self.hospital_syncs.get(hospital_id)
+
+    def sync_for_patient(self, patient_id: str):
+        """The connector for the hospital treating this family.
+
+        Write-back needs this: approving an option books a slot, and it must be
+        booked in *that family's* hospital, not whichever system happens to be
+        first in the dictionary.
+        """
+        patient = self.world.patient(patient_id)
+        if patient is None:
+            return None
+        return self.hospital_syncs.get(patient.hospital_id)
 
     async def _partner_loop(self) -> None:
         """Every few seconds, hear back from any simulated organisation whose time has come."""
@@ -926,6 +1045,7 @@ class LiveRunner:
                         created_at=option_set.created_at,
                     )
                 )
+        await self._file_approval_task(patient_id, option_set, disruption)
         self.bus.publish(
             EventKind.OPTIONS_READY,
             self.world.today.isoformat(),
@@ -982,6 +1102,12 @@ class LiveRunner:
             )
         disruption = self.world.disruptions.get(option_set.disruption_id)
 
+        # Before anything is recorded here and before any phone rings: put the
+        # date into the hospital's own diary. If it refuses, this raises and
+        # the rest of the method never runs — the option stays pending and no
+        # family is told a time the hospital did not agree to.
+        await self._write_back(patient_id, option)
+
         async with self._lock:
             del self.options[patient_id]
             self.world.pending_approval.pop(patient_id, None)
@@ -1003,6 +1129,7 @@ class LiveRunner:
         self.approvals.append(approval)
         if self.world.store is not None:
             self.world.store.add_approval(approval)
+        await self._close_approval_task(patient_id, outcome="approved", by=approved_by)
         self.ledger.record_once(
             patient_id=patient_id,
             source=SourceSystem.NAVIGATOR,
@@ -1030,6 +1157,200 @@ class LiveRunner:
         await self.plan_patient(patient_id, allow_render=True)
         await self._fan_out_approval_messages(patient_id, option)
         return approval
+
+    async def _file_approval_task(self, patient_id: str, option_set, disruption) -> None:
+        """Put the request on the hospital's own record, as a FHIR Task.
+
+        So that a change proposed to a hospital exists in that hospital's
+        system — queryable and auditable by them, without asking us. The
+        decision is still made in Saathi's panel, because Bahmni accepts a
+        Task over its API and has no screen that shows one; writing it there
+        alone would file the request where nobody looks.
+
+        Never blocks. A hospital that refuses the task still gets the
+        suggestion and the desk still decides: an audit convenience must not
+        be able to stop a family being re-planned.
+        """
+        system = self.hospitals(self._hospital_of(patient_id)) if self.hospitals else None
+        if system is None or not getattr(system, "live", False):
+            return
+        patient = self.world.patient(patient_id)
+        if patient is None:
+            return
+
+        from ..ports.fhir import approval_task
+
+        requires_doctor = any(self.touches_treatment(o) for o in option_set.options)
+        resource = self.world.resources.get(disruption.resource_id) if disruption else None
+        what = resource.display_name if resource else (disruption.resource_id if disruption else "")
+        sync = self.hospital_syncs.get(patient.hospital_id)
+        booking = None
+        if sync is not None:
+            step = self.world.step(option_set.options[0].target_step_id)
+            if step is not None:
+                booking = sync.booking_for(patient_id, step)
+
+        task = approval_task(
+            patient_ref=booking.patient_ref if booking else "",
+            patient_display=patient.name or patient_id,
+            summary=(
+                f"Re-plan after {what} became unavailable"
+                + (f" ({booking.starts_at:%d %b %H:%M})" if booking else "")
+            ),
+            description=_describe_options(option_set.options),
+            requested_at=datetime.now(UTC),
+            options=len(option_set.options),
+            requires_doctor=requires_doctor,
+        )
+        try:
+            ref = await asyncio.to_thread(system.create_task, task)
+        except Exception as exc:  # noqa: BLE001 - an audit record must not block care
+            logger.warning("could not file an approval task for %s: %s", patient_id, exc)
+            self._bump("hospital:task_refused")
+            return
+
+        self.approval_tasks[patient_id] = (ref, task)
+        self._bump("hospital:task_filed")
+        logger.info("filed approval task %s for %s in the hospital's own system", ref, patient_id)
+
+    async def _close_approval_task(self, patient_id: str, *, outcome: str, by: str) -> None:
+        """Record on the hospital's own task what a person decided, and when."""
+        held = self.approval_tasks.pop(patient_id, None)
+        if held is None:
+            return
+        ref, task = held
+        system = self.hospitals(self._hospital_of(patient_id)) if self.hospitals else None
+        if system is None:
+            return
+
+        from ..ports.fhir import completed_task
+
+        try:
+            await asyncio.to_thread(
+                system.update_task,
+                ref,
+                completed_task(task, outcome=outcome, by=by, at=datetime.now(UTC)),
+            )
+        except Exception as exc:  # noqa: BLE001 - as above
+            logger.warning("could not close approval task %s: %s", ref, exc)
+            return
+        self._bump(f"hospital:task_{outcome}")
+
+    def _hospital_of(self, patient_id: str) -> str:
+        patient = self.world.patient(patient_id)
+        return patient.hospital_id if patient else ""
+
+    async def reject_options(
+        self,
+        *,
+        patient_id: str,
+        rejected_by_role: Role,
+        rejected_by: str,
+        reason: str = "",
+    ) -> dict:
+        """None of these will do; the desk takes this family on by hand.
+
+        A real desk sometimes knows something the option table does not — a
+        family already at the station, a consultant who will see them anyway.
+        Without this verb that knowledge has nowhere to go and the only way to
+        clear the queue is to approve something nobody believes in.
+
+        Deliberately narrow. Nothing is written back to the hospital, nothing
+        is sent to the family, and no new plan is promised: the options are
+        cleared, the decision is recorded with a name against it, and the
+        family drops back to whatever the planner honestly says — which, with
+        their booking gone, is UNCERTAIN, and puts them on the list of people
+        who need a person. That is the true state, and a desk that rejected
+        every option has just said so.
+        """
+        option_set = self.options.get(patient_id)
+        if option_set is None:
+            raise LookupError("no options are waiting for this patient")
+
+        async with self._lock:
+            del self.options[patient_id]
+            self.world.pending_approval.pop(patient_id, None)
+            if self.world.store is not None:
+                self.world.store.delete_option_set(patient_id)
+
+        entry = self.ledger.record_once(
+            patient_id=patient_id,
+            source=SourceSystem.NAVIGATOR,
+            source_record_id=f"rejection:{option_set.disruption_id}:{patient_id}",
+            claim=(
+                f"{rejected_by_role.value} turned down all "
+                f"{len(option_set.options)} options for disruption "
+                f"{option_set.disruption_id}"
+            ),
+            metadata={"rejected_by": rejected_by, "reason": reason},
+        )
+        self.bus.publish(
+            EventKind.OPTIONS_REJECTED,
+            self.world.today.isoformat(),
+            patient_id=patient_id,
+            summary=(
+                f"{rejected_by} ({rejected_by_role.value}) turned down every option "
+                f"for {patient_id} — taking it on by hand"
+            ),
+            disruption_id=option_set.disruption_id,
+            reason=reason,
+        )
+        self._bump("options:rejected")
+        await self._close_approval_task(patient_id, outcome="rejected", by=rejected_by)
+        await self.plan_patient(patient_id)
+        return {
+            "patient_id": patient_id,
+            "disruption_id": option_set.disruption_id,
+            "rejected_by": rejected_by,
+            "rejected_by_role": rejected_by_role.value,
+            "reason": reason,
+            "ledger_id": entry.id,
+        }
+
+    async def _write_back(self, patient_id: str, option: PlanOption):
+        """Book the approved slot in the hospital system.
+
+        Does nothing and says so quietly when there is no HMS connected, when
+        the option carries no target date, or when the hospital holds no
+        booking for this step — all three are ordinary states, not failures.
+        Anything else raises `HospitalUnavailable` up through `approve_option`,
+        which is the point: a write-back that failed silently would leave the
+        hospital's diary and the family's plan disagreeing, with only the
+        family finding out.
+        """
+        if option.target_on is None:
+            return None
+        step = self.world.step(option.target_step_id)
+        if step is None:
+            return None
+        # The family's own hospital, not whichever system answered first. A
+        # slot booked into the wrong hospital is worse than no slot at all.
+        sync = self.sync_for_patient(patient_id)
+        if sync is None:
+            return None
+
+        async with self.working(
+            "Booking the new slot in the hospital system",
+            patient_id=patient_id,
+            detail=f"{step.kind.value.replace('_', ' ')} on {option.target_on:%a %d %b}",
+        ):
+            booked = await sync.rebook(
+                patient_id=patient_id, step=step, target_on=option.target_on
+            )
+
+        if booked is not None:
+            self.ledger.record_once(
+                patient_id=patient_id,
+                source=SourceSystem.HOSPITAL_FEED,
+                source_record_id=f"appointment:{booked.ref}",
+                claim=(
+                    f"{booked.service_name or 'appointment'} booked for "
+                    f"{booked.starts_at:%d %b %H:%M} in the hospital system"
+                ),
+                metadata={"written_back": True, "step_id": step.id},
+            )
+            self._bump("hospital:written_back")
+        return booked
 
     async def _fan_out_approval_messages(self, patient_id: str, option: PlanOption) -> None:
         """Every family member hears the change, each on their own channel."""

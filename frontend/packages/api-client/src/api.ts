@@ -295,6 +295,12 @@ export interface PendingOption {
   disruption_id: string;
   option_count: number;
   requires_doctor: boolean;
+  /**
+   * Whether the hospital caused this change, read from the disruption's
+   * `raised_by`. When it did, the desk is offered the welfare fund: a family
+   * should not pay for the hospital's own rescheduling.
+   */
+  hospital_caused: boolean;
   created_at: string;
 }
 
@@ -344,6 +350,23 @@ export const disruptions = {
       method: "POST",
       body: JSON.stringify(body),
     }),
+  /**
+   * Turn every option down and take the family on by hand.
+   *
+   * Gated like approving, because clearing a family out of the queue has
+   * consequences for them. Nothing is written back to the hospital and the
+   * family is not messaged: the decision is recorded with a name against it,
+   * and the planner goes back to saying what is actually true — which, with
+   * the booking gone, puts them on the list of people who need a person.
+   */
+  reject: (
+    disruptionId: string,
+    body: { patient_id: string; rejected_by_role: Role; rejected_by: string; reason?: string },
+  ) =>
+    request<{ patient_id: string; disruption_id: string; ledger_id: string }>(
+      `/disruptions/${disruptionId}/reject`,
+      { method: "POST", body: JSON.stringify(body) },
+    ),
 };
 
 export const ivr = {
